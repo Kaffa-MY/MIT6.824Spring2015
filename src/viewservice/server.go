@@ -16,8 +16,48 @@ type ViewServer struct {
 	rpccount int32 // for testing
 	me       string
 
-
 	// Your declarations here.
+	timeStamp map[string]time.Time // keep track of the most recent time at which the viewservice has heard a Ping from each server
+	view      *View                // keep track of the current view
+	viewAcked bool
+}
+
+// update view when some server has changed
+func (vs *ViewServer) updateView(primary string, backup string) bool {
+	if vs.view.Primary != primary || vs.view.Backup != backup {
+		vs.view = &View{vs.view.Viewnum + 1, primary, backup}
+		vs.viewAcked = false
+		return true
+	}
+	return false
+}
+
+// remove some server when it is dead
+func (vs *ViewServer) removeServer(server string) bool {
+	switch server {
+	case vs.view.Primary:
+		if vs.viewAcked && vs.view.Backup != "" {
+			vs.updateView(vs.view.Backup, "")
+		}
+
+	case vs.view.Backup:
+		vs.updateView(vs.view.Primary, "")
+	}
+	return true
+}
+
+// add an idle server when it is needed
+func (vs *ViewServer) addServer(server string) bool {
+	if !vs.viewAcked {
+		return false
+	} else {
+		if vs.view.Primary == "" {
+			return vs.updateView(server, "")
+		} else if vs.view.Backup == "" && vs.view.Primary != server {
+			return vs.updateView(vs.view.Primary, server)
+		}
+		return false
+	}
 }
 
 //
@@ -26,7 +66,36 @@ type ViewServer struct {
 func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 
 	// Your code here.
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
 
+	server, viewNum := args.Me, args.Viewnum
+	switch server {
+	case vs.view.Primary:
+		if viewNum == vs.view.Viewnum {
+			vs.viewAcked = true
+			vs.timeStamp[server] = time.Now()
+		} else {
+			// primary has crashed
+			if vs.viewAcked && vs.view.Backup != "" {
+				vs.updateView(vs.view.Backup, "")
+			}
+		}
+
+	case vs.view.Backup:
+		if viewNum == vs.view.Viewnum {
+			vs.timeStamp[server] = time.Now()
+		} else {
+			// backup has crashed
+			vs.updateView(vs.view.Primary, "")
+		}
+
+	default:
+		vs.addServer(server)
+
+	}
+
+	reply.View = *vs.view //right?
 	return nil
 }
 
@@ -36,19 +105,28 @@ func (vs *ViewServer) Ping(args *PingArgs, reply *PingReply) error {
 func (vs *ViewServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
-
+	reply.View = *vs.view
 	return nil
 }
-
 
 //
 // tick() is called once per PingInterval; it should notice
 // if servers have died or recovered, and change the view
 // accordingly.
 //
+
 func (vs *ViewServer) tick() {
 
 	// Your code here.
+	vs.mu.Lock()
+	defer vs.mu.Unlock()
+
+	for server, stamp := range vs.timeStamp {
+		if time.Since(stamp) >= DeadPings*PingInterval {
+			vs.removeServer(server)
+		}
+	}
+
 }
 
 //
@@ -76,7 +154,12 @@ func (vs *ViewServer) GetRPCCount() int32 {
 func StartServer(me string) *ViewServer {
 	vs := new(ViewServer)
 	vs.me = me
+
 	// Your vs.* initializations here.
+	vs.mu = sync.Mutex{}
+	vs.timeStamp = make(map[string]time.Time)
+	vs.view = &View{0, "", ""}
+	vs.viewAcked = true
 
 	// tell net/rpc about our RPC server and handlers.
 	rpcs := rpc.NewServer()
