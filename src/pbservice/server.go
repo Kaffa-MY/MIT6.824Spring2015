@@ -12,8 +12,6 @@ import "os"
 import "syscall"
 import "math/rand"
 
-
-
 type PBServer struct {
 	mu         sync.Mutex
 	l          net.Listener
@@ -21,26 +19,173 @@ type PBServer struct {
 	unreliable int32 // for testing
 	me         string
 	vs         *viewservice.Clerk
+
 	// Your declarations here.
+	view viewservice.View  // current view
+	kv   map[string]string // key-value store
+	seq  map[int64]int64   // id->seq of client
 }
 
+func (pb *PBServer) isPrimary() bool {
+	return pb.me == pb.view.Primary
+}
+
+func (pb *PBServer) isBackup() bool {
+	return pb.me == pb.view.Backup
+}
+
+func (pb *PBServer) hasBackup() bool {
+	return pb.view.Backup != ""
+}
 
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
+	//fmt.Printf("Server Get arg=%v\n", *args)
+
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	var forwardArg ForwardArg
+	var forwardReply FordwardReply
+
+	forwardArg.Operation = OpGet
+	forwardArg.Key = args.Key
+
+	if !pb.isPrimary() {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	if pb.hasBackup() {
+		ok := call(pb.view.Backup, "PBServer.Forward", forwardArg, &forwardReply)
+		if !ok || forwardReply.Err != OK {
+			reply.Err = ErrWrongServer
+			return nil
+		}
+	}
+
+	value, ok := pb.kv[args.Key]
+	if !ok {
+		reply.Err = ErrNoKey
+		return nil
+	}
+
+	reply.Err = OK
+	reply.Value = value
 
 	return nil
 }
-
 
 func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error {
 
 	// Your code here.
+	//fmt.Printf("Server PutAppend args=%v\n", *args)
 
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	var forwardArg ForwardArg
+	var forwardReply FordwardReply
+
+	forwardArg.Operation = args.Operation
+	forwardArg.Key = args.Key
+	forwardArg.Value = args.Value
+	forwardArg.ClientId = args.ClientId
+	forwardArg.Seq = args.Seq
+
+	if !pb.isPrimary() {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+
+	reply.Err = OK
+	switch args.Operation {
+	case OpPut:
+		if pb.seq[args.ClientId] < args.Seq {
+			pb.kv[args.Key] = args.Value
+		}
+	case OpAppend:
+		if pb.seq[args.ClientId] < args.Seq {
+			prev, exist := pb.kv[args.Key]
+			if !exist {
+				prev = ""
+			}
+			pb.kv[args.Key] = prev + args.Value
+			pb.seq[args.ClientId] = args.Seq
+		}
+	}
+
+	if pb.hasBackup() {
+		ok := call(pb.view.Backup, "PBServer.Forward", forwardArg, &forwardReply)
+		if !ok || forwardReply.Err != OK {
+			reply.Err = ErrWrongServer
+			return nil
+		}
+	}
+
+	//fmt.Printf("Server PutAppend result: %v\n", *reply)
 
 	return nil
 }
 
+// It turns out the primary must send Gets as well as Puts to the backup (if there is one),
+// and must wait for the backup to reply before responding to the client.
+// This helps prevent two servers from acting as primary (a "split brain")
+func (pb *PBServer) Forward(args *ForwardArg, reply *FordwardReply) error {
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	if !pb.isBackup() {
+		reply.Err = ErrWrongServer
+		return nil
+	}
+	op := args.Operation
+	switch op {
+	case OpGet:
+		reply.Err = OK
+	case OpPut:
+		reply.Err = OK
+		if pb.seq[args.ClientId] < args.Seq {
+			pb.kv[args.Key] = args.Value
+		}
+	case OpAppend:
+		reply.Err = OK
+		if pb.seq[args.ClientId] < args.Seq {
+			prev, exist := pb.kv[args.Key]
+			if !exist {
+				prev = ""
+			}
+			pb.kv[args.Key] = prev + args.Value
+			pb.seq[args.ClientId] = args.Seq
+		}
+	}
+	return nil
+}
+
+func (pb *PBServer) Sync(arg *SyncArgs, reply *SyncReply) error {
+	//fmt.Printf("Sync ... \n")
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+
+	v, _ := pb.vs.Ping(pb.view.Viewnum)
+
+	// update view of backup
+	if v.Viewnum != pb.view.Viewnum {
+		pb.view = v
+	}
+
+	// check the current backup
+	if pb.isBackup() {
+		pb.kv = arg.KV
+		pb.seq = arg.Seq
+		reply.Err = OK
+	} else {
+		reply.Err = ErrWrongServer
+	}
+	//fmt.Printf("Sync done!\n")
+	return nil
+}
 
 //
 // ping the viewserver periodically.
@@ -51,6 +196,20 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 func (pb *PBServer) tick() {
 
 	// Your code here.
+	pb.mu.Lock()
+	defer pb.mu.Unlock()
+	view, _ := pb.vs.Ping(pb.view.Viewnum)
+
+	if pb.view != view {
+		pb.view = view
+		// sync between primary and backup
+		if pb.isPrimary() && pb.hasBackup() {
+			args := &SyncArgs{pb.kv, pb.seq}
+			reply := &SyncReply{}
+			call(pb.view.Backup, "PBServer.Sync", args, &reply)
+		}
+	}
+
 }
 
 // tell the server to shut itself down.
@@ -77,13 +236,16 @@ func (pb *PBServer) isunreliable() bool {
 	return atomic.LoadInt32(&pb.unreliable) != 0
 }
 
-
 func StartServer(vshost string, me string) *PBServer {
 	pb := new(PBServer)
 	pb.me = me
 	pb.vs = viewservice.MakeClerk(me, vshost)
 	// Your pb.* initializations here.
-
+	//fmt.Printf("Start Server now ...\n")
+	pb.kv = make(map[string]string)
+	pb.seq = make(map[int64]int64)
+	pb.view = viewservice.View{0, "", ""}
+	//fmt.Printf("initial PBServer is %v\n", pb)
 	rpcs := rpc.NewServer()
 	rpcs.Register(pb)
 

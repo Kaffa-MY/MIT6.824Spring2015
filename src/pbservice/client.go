@@ -7,10 +7,14 @@ import "fmt"
 import "crypto/rand"
 import "math/big"
 
+import "time"
 
 type Clerk struct {
 	vs *viewservice.Clerk
-	// Your declarations here
+	// Your declarations
+	id   int64
+	seq  int64
+	view viewservice.View
 }
 
 // this may come in handy.
@@ -25,10 +29,11 @@ func MakeClerk(vshost string, me string) *Clerk {
 	ck := new(Clerk)
 	ck.vs = viewservice.MakeClerk(me, vshost)
 	// Your ck.* initializations here
-
+	ck.id = nrand()
+	ck.seq = 0
+	ck.view = viewservice.View{0, "", ""}
 	return ck
 }
-
 
 //
 // call() sends an RPC to the rpcname handler on server srv
@@ -74,8 +79,22 @@ func call(srv string, rpcname string,
 func (ck *Clerk) Get(key string) string {
 
 	// Your code here.
+	//fmt.Printf("Client Get key=%v\n", key)
+	ck.seq++
+	args := &GetArgs{key}
+	var reply GetReply
 
-	return "???"
+	ok := call(ck.view.Primary, "PBServer.Get", args, &reply)
+	//
+	for !ok || reply.Err == ErrWrongServer {
+		//fmt.Printf("Client Get retry: ok=%v, reply.Err=%v\n", ok, reply.Err)
+		ck.view, _ = ck.vs.Ping(ck.view.Viewnum)
+		time.Sleep(viewservice.PingInterval)
+
+		ok = call(ck.view.Primary, "PBServer.Get", args, &reply)
+	}
+	//fmt.Printf("Client Get result:%v\n", reply.Value)
+	return reply.Value
 }
 
 //
@@ -84,6 +103,20 @@ func (ck *Clerk) Get(key string) string {
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
+	ck.seq++
+	args := &PutAppendArgs{key, value, op, ck.id, ck.seq}
+	var reply PutAppendReply
+
+	ok := call(ck.view.Primary, "PBServer.PutAppend", args, &reply)
+	//
+	for !ok || reply.Err == ErrWrongServer {
+		//fmt.Printf("Client PutAppend retry: ok=%v, reply.Err=%v\n", ok, reply.Err)
+
+		ck.view, _ = ck.vs.Ping(ck.view.Viewnum)
+		time.Sleep(viewservice.PingInterval)
+
+		ok = call(ck.view.Primary, "PBServer.PutAppend", args, &reply)
+	}
 }
 
 //
