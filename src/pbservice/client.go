@@ -81,12 +81,11 @@ func (ck *Clerk) Get(key string) string {
 	// Your code here.
 	//fmt.Printf("Client Get key=%v\n", key)
 	ck.seq++
-	args := &GetArgs{key}
+	args := &GetArgs{key, ck.id, ck.seq, false}
 	var reply GetReply
 
 	ok := call(ck.view.Primary, "PBServer.Get", args, &reply)
-	//
-	for !ok || reply.Err == ErrWrongServer {
+	for !ok || reply.Err != OK {
 		//fmt.Printf("Client Get retry: ok=%v, reply.Err=%v\n", ok, reply.Err)
 		ck.view, _ = ck.vs.Ping(ck.view.Viewnum)
 		time.Sleep(viewservice.PingInterval)
@@ -104,14 +103,12 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 
 	// Your code here.
 	ck.seq++
-	args := &PutAppendArgs{key, value, op, ck.id, ck.seq}
+	args := &PutAppendArgs{key, value, op, ck.id, ck.seq, false}
 	var reply PutAppendReply
 
 	ok := call(ck.view.Primary, "PBServer.PutAppend", args, &reply)
-	//
-	for !ok || reply.Err == ErrWrongServer {
+	for !ok || reply.Err != OK {
 		//fmt.Printf("Client PutAppend retry: ok=%v, reply.Err=%v\n", ok, reply.Err)
-
 		ck.view, _ = ck.vs.Ping(ck.view.Viewnum)
 		time.Sleep(viewservice.PingInterval)
 

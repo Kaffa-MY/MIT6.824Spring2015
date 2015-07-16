@@ -38,6 +38,26 @@ func (pb *PBServer) hasBackup() bool {
 	return pb.view.Backup != ""
 }
 
+func (pb *PBServer) Put(args *PutAppendArgs, reply *PutAppendReply) {
+	if args.Seq > pb.seq[args.ClientId] {
+		pb.kv[args.Key] = args.Value
+		pb.seq[args.ClientId] = args.Seq
+	}
+	reply.Err = OK
+}
+
+func (pb *PBServer) Append(args *PutAppendArgs, reply *PutAppendReply) {
+	if pb.seq[args.ClientId] < args.Seq {
+		prev, exist := pb.kv[args.Key]
+		if !exist {
+			prev = ""
+		}
+		pb.kv[args.Key] = prev + args.Value
+		pb.seq[args.ClientId] = args.Seq
+	}
+	reply.Err = OK
+}
+
 func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 
 	// Your code here.
@@ -46,34 +66,31 @@ func (pb *PBServer) Get(args *GetArgs, reply *GetReply) error {
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	var forwardArg ForwardArg
-	var forwardReply FordwardReply
-
-	forwardArg.Operation = OpGet
-	forwardArg.Key = args.Key
-
-	if !pb.isPrimary() {
+	if pb.isBackup() && args.Forwarded {
+		reply.Err = OK
+	} else if pb.isBackup() && !args.Forwarded {
 		reply.Err = ErrWrongServer
-		return nil
-	}
+	} else if pb.isPrimary() && args.Forwarded {
+		reply.Err = ErrWrongServer
+	} else if pb.isPrimary() && !args.Forwarded {
+		value, exist := pb.kv[args.Key]
+		if !exist {
+			reply.Value = ""
+		} else {
+			reply.Value = value
+		}
+		reply.Err = OK
 
-	if pb.hasBackup() {
-		ok := call(pb.view.Backup, "PBServer.Forward", forwardArg, &forwardReply)
-		if !ok || forwardReply.Err != OK {
-			reply.Err = ErrWrongServer
-			return nil
+		if pb.hasBackup() {
+			forwardArg := &GetArgs{args.Key, args.ClientId, args.Seq, true}
+			forwardReply := &GetReply{}
+			ok := call(pb.view.Backup, "PBServer.Get", forwardArg, &forwardReply)
+			if !ok || (forwardReply.Err == ErrWrongServer) {
+				reply.Err = ErrWrongServer
+				return nil
+			}
 		}
 	}
-
-	value, ok := pb.kv[args.Key]
-	if !ok {
-		reply.Err = ErrNoKey
-		return nil
-	}
-
-	reply.Err = OK
-	reply.Value = value
-
 	return nil
 }
 
@@ -81,87 +98,126 @@ func (pb *PBServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) error 
 
 	// Your code here.
 	//fmt.Printf("Server PutAppend args=%v\n", *args)
-
 	pb.mu.Lock()
 	defer pb.mu.Unlock()
 
-	var forwardArg ForwardArg
-	var forwardReply FordwardReply
-
-	forwardArg.Operation = args.Operation
-	forwardArg.Key = args.Key
-	forwardArg.Value = args.Value
-	forwardArg.ClientId = args.ClientId
-	forwardArg.Seq = args.Seq
-
-	if !pb.isPrimary() {
+	if pb.isPrimary() && args.Forwarded {
 		reply.Err = ErrWrongServer
-		return nil
-	}
 
-	reply.Err = OK
-	switch args.Operation {
-	case OpPut:
-		if pb.seq[args.ClientId] < args.Seq {
-			pb.kv[args.Key] = args.Value
+	} else if pb.isPrimary() && !args.Forwarded {
+		switch args.Operation {
+		case OpPut:
+			pb.Put(args, reply)
+		case OpAppend:
+			pb.Append(args, reply)
 		}
-	case OpAppend:
-		if pb.seq[args.ClientId] < args.Seq {
-			prev, exist := pb.kv[args.Key]
-			if !exist {
-				prev = ""
+
+		if pb.hasBackup() {
+			forwardArgs := &PutAppendArgs{args.Key, args.Value, args.Operation, args.ClientId, args.Seq, true}
+			forwardReply := &PutAppendReply{}
+			ok := call(pb.view.Backup, "PBServer.PutAppend", forwardArgs, &forwardReply)
+			if !ok || (forwardReply.Err == ErrWrongServer) {
+				reply.Err = ErrWrongServer
+				return nil
 			}
-			pb.kv[args.Key] = prev + args.Value
-			pb.seq[args.ClientId] = args.Seq
 		}
-	}
 
-	if pb.hasBackup() {
-		ok := call(pb.view.Backup, "PBServer.Forward", forwardArg, &forwardReply)
-		if !ok || forwardReply.Err != OK {
-			reply.Err = ErrWrongServer
-			return nil
+	} else if pb.isBackup() && args.Forwarded {
+		switch args.Operation {
+		case OpPut:
+			pb.Put(args, reply)
+
+		case OpAppend:
+			pb.Append(args, reply)
 		}
+	} else if pb.isBackup() && !args.Forwarded {
+		reply.Err = ErrWrongServer
 	}
-
-	//fmt.Printf("Server PutAppend result: %v\n", *reply)
 
 	return nil
+	////////////////////////old implementation/////////////////////////////////////
+
+	// var forwardArg ForwardArg
+	// var forwardReply FordwardReply
+
+	// forwardArg.Operation = args.Operation
+	// forwardArg.Key = args.Key
+	// forwardArg.Value = args.Value
+	// forwardArg.ClientId = args.ClientId
+	// forwardArg.Seq = args.Seq
+
+	// if !pb.isPrimary() {
+	// 	reply.Err = ErrWrongServer
+	// 	return nil
+	// }
+
+	// reply.Err = OK
+	// switch args.Operation {
+	// case OpPut:
+	// 	if pb.seq[args.ClientId] < args.Seq {
+	// 		pb.kv[args.Key] = args.Value
+	// 	} else {
+	// 		reply.Err = OK
+	// 		return nil
+	// 	}
+	// case OpAppend:
+	// 	if pb.seq[args.ClientId] < args.Seq {
+	// 		prev, exist := pb.kv[args.Key]
+	// 		if !exist {
+	// 			prev = ""
+	// 		}
+	// 		pb.kv[args.Key] = prev + args.Value
+	// 		pb.seq[args.ClientId] = args.Seq
+	// 	} else {
+	// 		reply.Err = OK
+	// 		return nil
+	// 	}
+	// }
+
+	// if pb.hasBackup() {
+	// 	ok := call(pb.view.Backup, "PBServer.Forward", forwardArg, &forwardReply)
+	// 	if !ok || (forwardReply.Err == ErrWrongServer) {
+	// 		reply.Err = ErrWrongServer
+	// 		return nil
+	// 	}
+	// }
+
+	//fmt.Printf("Server PutAppend result: %v\n", *reply)
 }
 
 // It turns out the primary must send Gets as well as Puts to the backup (if there is one),
 // and must wait for the backup to reply before responding to the client.
 // This helps prevent two servers from acting as primary (a "split brain")
-func (pb *PBServer) Forward(args *ForwardArg, reply *FordwardReply) error {
-	pb.mu.Lock()
-	defer pb.mu.Unlock()
+// func (pb *PBServer) Forward(args *ForwardArg, reply *FordwardReply) error {
+// 	pb.mu.Lock()
+// 	defer pb.mu.Unlock()
 
-	if !pb.isBackup() {
-		reply.Err = ErrWrongServer
-		return nil
-	}
-	op := args.Operation
-	switch op {
-	case OpGet:
-		reply.Err = OK
-	case OpPut:
-		reply.Err = OK
-		if pb.seq[args.ClientId] < args.Seq {
-			pb.kv[args.Key] = args.Value
-		}
-	case OpAppend:
-		reply.Err = OK
-		if pb.seq[args.ClientId] < args.Seq {
-			prev, exist := pb.kv[args.Key]
-			if !exist {
-				prev = ""
-			}
-			pb.kv[args.Key] = prev + args.Value
-			pb.seq[args.ClientId] = args.Seq
-		}
-	}
-	return nil
-}
+// 	if !pb.isBackup() {
+// 		reply.Err = ErrWrongServer
+// 		return nil
+// 	}
+// 	op := args.Operation
+// 	switch op {
+// 	case OpGet:
+// 		reply.Err = OK
+// 	case OpPut:
+// 		reply.Err = OK
+// 		if pb.seq[args.ClientId] < args.Seq {
+// 			pb.kv[args.Key] = args.Value
+// 		}
+// 	case OpAppend:
+// 		reply.Err = OK
+// 		if pb.seq[args.ClientId] < args.Seq {
+// 			prev, exist := pb.kv[args.Key]
+// 			if !exist {
+// 				prev = ""
+// 			}
+// 			pb.kv[args.Key] = prev + args.Value
+// 			pb.seq[args.ClientId] = args.Seq
+// 		}
+// 	}
+// 	return nil
+// }
 
 func (pb *PBServer) Sync(arg *SyncArgs, reply *SyncReply) error {
 	//fmt.Printf("Sync ... \n")
